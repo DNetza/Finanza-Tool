@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5,6 +6,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Finanzas Tool — Gestión Personal 2026</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://apis.google.com/js/api.js" async defer></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 :root{
@@ -121,6 +124,10 @@ tbody tr:nth-child(even) td{background:#fafafa}
   <button class="tbtn" onclick="openReset()" style="border-color:#dc2626;color:#dc2626;">🗑 Limpiar mes</button>
   <button class="tbtn" id="btn-recurrentes" onclick="openRecurrentesPendientes()" style="display:none;border-color:#2563eb;color:#2563eb">🔁 Pendientes <span id="badge-recurrentes" style="background:#2563eb;color:white;border-radius:10px;padding:0 6px;font-size:0.7rem;margin-left:3px"></span></button>
   <span class="save-ind ok" id="save-ind">✓ Guardado</span>
+  <button id="gdrive-btn" onclick="gdriveLogin()" style="font-size:0.7rem;padding:3px 10px;border:1px solid #4285f4;color:#4285f4;background:none;border-radius:6px;cursor:pointer;margin-left:8px">
+    ☁ Conectar Drive
+  </button>
+  <span id="gdrive-status" style="font-size:0.65rem;color:var(--gray);margin-left:6px"></span>
 </div>
 
 <div class="tabs" id="tabs-bar">
@@ -871,16 +878,17 @@ function scheduleSave(){
   const el=document.getElementById('save-ind');
   el.textContent='⏳ Guardando...';el.className='save-ind wait';
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(()=>{
-    try{
-      localStorage.setItem('finanzas_tool_v1',JSON.stringify({
-        _dataVersion_: _DATA_VERSION_,
-        txs, uber:uberSessions, cfg,
-        deletedIds:[...deletedIds],
-        editedTxs:[...editedTxs.values()]
-      }));
-    }catch(e){}
-    el.textContent='✓ Guardado';el.className='save-ind ok';
+  saveTimer=setTimeout(async ()=>{
+    const data={
+      _dataVersion_: _DATA_VERSION_,
+      txs, uber:uberSessions, cfg,
+      deletedIds:[...deletedIds],
+      editedTxs:[...editedTxs.values()]
+    };
+    try{ localStorage.setItem('finanzas_tool_v1',JSON.stringify(data)); }catch(e){}
+    if(gdriveReady) await gdriveSave();
+    el.textContent=gdriveReady?'✓ Guardado en Drive':'✓ Guardado';
+    el.className='save-ind ok';
   },700);
 }
 
@@ -3108,6 +3116,136 @@ function confirmarTodasRecurrentes(){
 }
 
 // ════════════════════════════════════════════════
+// GOOGLE DRIVE INTEGRATION
+// ════════════════════════════════════════════════
+const GDRIVE_CLIENT_ID='1070094857-1vcfifgfq2oiads43sch4i694ciul305.apps.googleusercontent.com';
+const GDRIVE_SCOPES='https://www.googleapis.com/auth/drive.appdata';
+const GDRIVE_FILE='finanzas_tool_data.json';
+let gdriveToken=null;
+let gdriveFileId=null;
+let gdriveReady=false;
+
+function gdriveLogin(){
+  const client=google.accounts.oauth2.initTokenClient({
+    client_id: GDRIVE_CLIENT_ID,
+    scope: GDRIVE_SCOPES,
+    callback:(resp)=>{
+      if(resp.error){console.error(resp);return;}
+      gdriveToken=resp.access_token;
+      gdriveReady=true;
+      document.getElementById('gdrive-btn').textContent='☁ Drive conectado';
+      document.getElementById('gdrive-btn').style.color='#16a34a';
+      document.getElementById('gdrive-btn').style.borderColor='#16a34a';
+      document.getElementById('gdrive-btn').onclick=gdriveLogout;
+      document.getElementById('gdrive-status').textContent='Cargando datos...';
+      gdriveLoad();
+    }
+  });
+  client.requestAccessToken();
+}
+
+function gdriveLogout(){
+  gdriveToken=null; gdriveReady=false; gdriveFileId=null;
+  document.getElementById('gdrive-btn').textContent='☁ Conectar Drive';
+  document.getElementById('gdrive-btn').style.color='#4285f4';
+  document.getElementById('gdrive-btn').style.borderColor='#4285f4';
+  document.getElementById('gdrive-btn').onclick=gdriveLogin;
+  document.getElementById('gdrive-status').textContent='Desconectado';
+}
+
+async function gdriveFindFile(){
+  const resp=await fetch(
+    'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%22'+GDRIVE_FILE+'%22&fields=files(id,name)',
+    {headers:{Authorization:'Bearer '+gdriveToken}}
+  );
+  const data=await resp.json();
+  return data.files&&data.files.length>0?data.files[0].id:null;
+}
+
+async function gdriveLoad(){
+  try{
+    gdriveFileId=await gdriveFindFile();
+    if(!gdriveFileId){
+      // No file yet — save current data to Drive
+      document.getElementById('gdrive-status').textContent='Primera vez — guardando en Drive...';
+      await gdriveSave();
+      document.getElementById('gdrive-status').textContent='✓ Conectado a Drive';
+      return;
+    }
+    // Load data from Drive
+    const resp=await fetch(
+      'https://www.googleapis.com/drive/v3/files/'+gdriveFileId+'?alt=media',
+      {headers:{Authorization:'Bearer '+gdriveToken}}
+    );
+    const p=await resp.json();
+    // Merge data same way as localStorage
+    if(p.txs&&p.txs.length>0){
+      const baseIds=new Set(txs.map(t=>t.id));
+      const userNew=p.txs.filter(t=>!baseIds.has(t.id));
+      txs=[...txs,...userNew];
+    }
+    if(p.uber&&p.uber.length>0){
+      const baseUberIds=new Set(uberSessions.map(u=>u.id));
+      const userNewUber=p.uber.filter(u=>!baseUberIds.has(u.id));
+      uberSessions=[...uberSessions,...userNewUber];
+    }
+    if(p.cfg) cfg=Object.assign({},cfg,p.cfg);
+    if(p.deletedIds){
+      const del=new Set(p.deletedIds);
+      deletedIds=del;
+      txs=txs.filter(t=>!del.has(t.id));
+      uberSessions=uberSessions.filter(u=>!del.has(u.id));
+    }
+    if(p.editedTxs){
+      p.editedTxs.forEach(edited=>{
+        editedTxs.set(edited.id,edited);
+        const idx=txs.findIndex(t=>t.id===edited.id);
+        if(idx>=0) txs[idx]=edited;
+      });
+    }
+    document.getElementById('gdrive-status').textContent='✓ Conectado a Drive';
+    renderAll();
+  }catch(e){
+    console.error('Drive load error:',e);
+    document.getElementById('gdrive-status').textContent='⚠ Error al cargar';
+  }
+}
+
+async function gdriveSave(){
+  if(!gdriveReady||!gdriveToken) return;
+  const data=JSON.stringify({
+    _dataVersion_: _DATA_VERSION_,
+    txs, uber:uberSessions, cfg,
+    deletedIds:[...deletedIds],
+    editedTxs:[...editedTxs.values()]
+  });
+  const blob=new Blob([data],{type:'application/json'});
+  try{
+    if(gdriveFileId){
+      // Update existing file
+      await fetch('https://www.googleapis.com/upload/drive/v3/files/'+gdriveFileId+'?uploadType=media',{
+        method:'PATCH',
+        headers:{Authorization:'Bearer '+gdriveToken,'Content-Type':'application/json'},
+        body:blob
+      });
+    } else {
+      // Create new file in appDataFolder
+      const meta={name:GDRIVE_FILE,parents:['appDataFolder']};
+      const form=new FormData();
+      form.append('metadata',new Blob([JSON.stringify(meta)],{type:'application/json'}));
+      form.append('file',blob);
+      const resp=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',{
+        method:'POST',
+        headers:{Authorization:'Bearer '+gdriveToken},
+        body:form
+      });
+      const result=await resp.json();
+      gdriveFileId=result.id;
+    }
+  }catch(e){console.error('Drive save error:',e);}
+}
+
+// ════════════════════════════════════════════════
 // BOOTSTRAP
 // ════════════════════════════════════════════════
 document.getElementById('date-pill').textContent=new Date().toLocaleDateString('es-MX',{day:'2-digit',month:'short',year:'numeric'});
@@ -3116,6 +3254,14 @@ syncUndoBtns();
 // Wait for full page load so Chart.js canvases are ready
 if(document.readyState==='complete'){renderAll();}
 else{window.addEventListener('load',renderAll);}
+// Auto-connect Google Drive when Google library is ready
+window.addEventListener('load', ()=>{
+  setTimeout(()=>{
+    if(typeof google!=='undefined'&&google.accounts&&google.accounts.oauth2){
+      gdriveLogin();
+    }
+  }, 2000);
+});
 </script>
 </body>
 </html>
